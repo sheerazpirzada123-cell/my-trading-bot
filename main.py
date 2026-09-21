@@ -21,6 +21,9 @@ LEVERAGE = 5                  # kam leverage = liquidation door
 TRADE_AMOUNT_USDT = 5.0       # ek trade me max margin
 RISK_PER_TRADE_PCT = 1.0      # SL lagne par balance ka max ~1% loss
 MAX_OPEN_POSITIONS = 2
+MAX_HARD_RISK_PCT = 4.0       # chhote balance par bhi ek trade ka max loss
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "270"))   # ek run itni der position dekhta rahega
+WATCH_EVERY = 30              # position har 30 sec check
 MAX_DAILY_LOSS_PCT = 3.0      # aaj ka loss itna ho jaye to naye trade band
 COOLDOWN_HOURS = 3            # loss wale coin par dobara itni der trade nahi
 
@@ -94,12 +97,13 @@ def analyse(symbol, client):
     e9, e21, e50 = ema(c, 9)[-1], ema(c, 21)[-1], ema(c, 50)[-1]
     h_e20, h_e50 = ema(k1h["close"], 20)[-1], ema(k1h["close"], 50)[-1]
     a = atr(k15["high"], k15["low"], c)
-    vol_avg = sum(k15["vol"][-21:-1]) / 20
+    vol_avg = sum(k15["vol"][-22:-2]) / 20
+    vol_recent = (k15["vol"][-1] + k15["vol"][-2]) / 2
     return {
         "price": c[-1], "e9": e9, "e21": e21, "e50": e50,
         "h_up": h_e20 > h_e50, "h_down": h_e20 < h_e50,
         "rsi": rsi(c), "atr": a, "atr_pct": a / c[-1] * 100,
-        "vol_ok": k15["vol"][-1] >= vol_avg,
+        "vol_ok": vol_recent >= 0.8 * vol_avg,
     }
 
 
@@ -107,19 +111,21 @@ def entry_signal(m):
     """('BUY'|'SELL'|None, score, reason)"""
     if not (MIN_ATR_PCT <= m["atr_pct"] <= MAX_ATR_PCT):
         return None, 0, f"ATR {m['atr_pct']:.2f}% range se bahar"
-    if not m["vol_ok"]:
-        return None, 0, "volume kam"
-    stretch = abs(m["price"] - m["e21"]) / m["atr"]
-    if stretch > 1.2:
-        return None, 0, "price EMA se bohat door (chase nahi karna)"
     strength = abs(m["e9"] - m["e50"]) / m["atr"]
+    side = None
     if (m["e9"] > m["e21"] > m["e50"] and m["price"] > m["e21"]
             and m["h_up"] and 50 <= m["rsi"] <= 66):
-        return "BUY", strength, "uptrend 15m+1h, RSI theek"
-    if (m["e9"] < m["e21"] < m["e50"] and m["price"] < m["e21"]
+        side = "BUY"
+    elif (m["e9"] < m["e21"] < m["e50"] and m["price"] < m["e21"]
             and m["h_down"] and 34 <= m["rsi"] <= 50):
-        return "SELL", strength, "downtrend 15m+1h, RSI theek"
-    return None, 0, "trend/RSI match nahi"
+        side = "SELL"
+    if not side:
+        return None, 0, "trend/RSI match nahi"
+    if abs(m["price"] - m["e21"]) / m["atr"] > 1.2:
+        return None, 0, f"{side} trend hai par price EMA se bohat door (chase nahi)"
+    if not m["vol_ok"]:
+        return None, 0, f"{side} trend hai par volume kam"
+    return side, strength, "trend 15m+1h + RSI + volume theek"
 
 
 def exit_reason(side, m, pnl_r, held_h):
@@ -283,6 +289,14 @@ def open_trade(client, sym, side, m, balance, filters):
     notional_cap = TRADE_AMOUNT_USDT * LEVERAGE
     qty = min(risk_usdt / sl_dist, notional_cap / price)
     qty = float(floor_step(qty, f["step"]))
+    # chhote balance par risk-size min order se chhota ban jata hai -> min order tak uthao
+    # (par sirf tab jab loss balance ke MAX_HARD_RISK_PCT se zyada na ho)
+    need = max(f["min_notional"] * 1.1 / price, f["min_qty"])
+    if qty < need:
+        qty = float(floor_step(need, f["step"]) + Decimal(str(f["step"])))
+        if qty * sl_dist > balance * MAX_HARD_RISK_PCT / 100 or qty * price > notional_cap:
+            log(f"{sym}: skip - min order (${qty * price:.2f}) is balance/TRADE_AMOUNT ke liye bada")
+            return False
     if qty < f["min_qty"] or qty * price < f["min_notional"]:
         log(f"{sym}: skip - qty*price=${qty * price:.2f} < min ${f['min_notional']}"
             f" (TRADE_AMOUNT_USDT ya balance badhao)")
@@ -334,36 +348,35 @@ def make_client():
     return Client(API_KEY, API_SECRET, testnet=TESTNET, requests_params=params)
 
 
-def run_cycle(client):
-    log(f"Mode: {'LIVE' if LIVE else 'PAPER (asli order nahi)'}"
-        f"{' [TESTNET]' if TESTNET else ''}")
-    filters = load_filters(client)
-
+def run_cycle(client, filters, first):
+    """Returns True agar abhi koi position khuli hai (to monitoring jaari rahe)."""
     balance = 0.0
     for b in client.futures_account_balance():
         if b["asset"] == "USDT":
             balance = float(b["balance"])
-    log(f"USDT balance: {balance:.2f}")
 
     positions = get_positions(client)
-
-    # orphan TP/SL saaf
     for o in open_algo(client):
         if o.get("symbol") in COINS and o["symbol"] not in positions and LIVE:
             log(f"orphan order cancel: {o['symbol']}")
             cancel_algo(client, o)
 
-    manage_positions(client, positions, filters)
-    positions = get_positions(client) if LIVE else positions
+    if positions:
+        manage_positions(client, positions, filters)
+        positions = get_positions(client) if LIVE else positions
 
+    if not first:              # naye trade sirf run ki shuruaat me dhoondte hain
+        return bool(positions)
+
+    log(f"USDT balance: {balance:.2f}")
     net_today, loss_syms = daily_stats(client)
     log(f"Aaj ka net PnL (fees ke saath): {net_today:+.3f} USDT")
     if balance > 0 and net_today <= -balance * MAX_DAILY_LOSS_PCT / 100:
         log(f"DAILY LOSS LIMIT ({MAX_DAILY_LOSS_PCT}%) hit - aaj naye trade band")
-        return
+        return bool(positions)
     if len(positions) >= MAX_OPEN_POSITIONS:
         log("Max positions khuli hain - naya trade nahi")
-        return
+        return bool(positions)
 
     best = None
     for sym in COINS:
@@ -382,8 +395,27 @@ def run_cycle(client):
 
     if best:
         open_trade(client, best[0], best[1], best[3], balance, filters)
-    else:
-        log("Koi acha setup nahi - trade nahi (ye theek hai, har waqt trade karna zaroori nahi)")
+        return LIVE or bool(positions)
+    log("Koi acha setup nahi - trade nahi (har waqt trade karna zaroori nahi)")
+    return bool(positions)
+
+
+def run_session(client):
+    log(f"Mode: {'LIVE' if LIVE else 'PAPER (asli order nahi)'}"
+        f"{' [TESTNET]' if TESTNET else ''}")
+    filters = load_filters(client)
+    deadline = time.time() + RUN_SECONDS
+    first = True
+    while True:
+        has_pos = run_cycle(client, filters, first)
+        first = False
+        if not has_pos:
+            return                      # dekhne ko kuch nahi, agla run 5 min baad
+        if time.time() + WATCH_EVERY > deadline:
+            log("Is run ka time khatam; position par server-side SL/TP laga hai, agla run dekhega")
+            return
+        log(f"Position khuli hai - {WATCH_EVERY}s baad dobara check...")
+        time.sleep(WATCH_EVERY)
 
 
 if __name__ == "__main__":
@@ -391,7 +423,7 @@ if __name__ == "__main__":
         log("BINANCE_API_KEY / BINANCE_SECRET_KEY secrets set nahi hain")
         sys.exit(1)
     try:
-        run_cycle(make_client())
+        run_session(make_client())
     except Exception as e:
         log(f"FATAL: {type(e).__name__}: {e}")
         sys.exit(1)   # ab GitHub run laal (fail) dikhayega, jhoota green nahi

@@ -22,10 +22,9 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: pip
 
     - name: Install dependencies
-      run: pip install -r requirements.txt
+      run: pip install "python-binance>=1.0.36"
 
     - name: Run Trading Bot
       env:
@@ -35,3 +34,4 @@ jobs:
         LIVE_TRADING: "false"      # <-- pehle false (paper) rakho, logs check karke "true" karo
         BINANCE_TESTNET: "false"
       run: python main.py
+      

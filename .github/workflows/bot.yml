@@ -12,7 +12,7 @@ concurrency:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 6
 
     steps:
     - name: Checkout repository
@@ -33,5 +33,5 @@ jobs:
         PROXY_URL: ${{ secrets.PROXY_URL }}
         LIVE_TRADING: "false"      # <-- pehle false (paper) rakho, logs check karke "true" karo
         BINANCE_TESTNET: "false"
+        RUN_SECONDS: "270"
       run: python main.py
-      

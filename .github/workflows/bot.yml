@@ -12,7 +12,7 @@ concurrency:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 350   # GitHub ka hard cap 360 min (6h) hai - buffer chhod diya
 
     steps:
     - name: Checkout repository
@@ -33,5 +33,5 @@ jobs:
         PROXY_URL: ${{ secrets.PROXY_URL }}
         LIVE_TRADING: "false"      # <-- pehle false (paper) rakho, logs check karke "true" karo
         BINANCE_TESTNET: "false"
-        RUN_SECONDS: "270"
+        RUN_SECONDS: "20400"   # ~340 min - trade ko TP/SL tak isi run me monitor karega
       run: python main.py
